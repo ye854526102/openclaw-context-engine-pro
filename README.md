@@ -1,5 +1,7 @@
 # @ye854526102/openclaw-context-engine-pro
 
+**[中文文档](./README_CN.md)** | **English**
+
 > Advanced context management engine for [OpenClaw](https://github.com/openclaw/openclaw) with intelligent compaction, message prioritization, and token optimization.
 
 [![npm version](https://img.shields.io/npm/v/@ye854526102/openclaw-context-engine-pro.svg)](https://www.npmjs.com/package/@ye854526102/openclaw-context-engine-pro)

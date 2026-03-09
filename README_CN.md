@@ -1,5 +1,7 @@
 # @ye854526102/openclaw-context-engine-pro
 
+**中文文档** | **[English](./README.md)**
+
 > OpenClaw 高级上下文管理引擎，支持智能压缩、消息优先级排序和 Token 优化。
 
 [![npm version](https://img.shields.io/npm/v/@ye854526102/openclaw-context-engine-pro.svg)](https://www.npmjs.com/package/@ye854526102/openclaw-context-engine-pro)
