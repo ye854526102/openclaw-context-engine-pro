@@ -1,0 +1,10 @@
+# @ye854526102/openclaw-context-engine-pro
+
+dist/
+node_modules/
+*.log
+.DS_Store
+coverage/
+.env
+.env.local
+*.tsbuildinfo

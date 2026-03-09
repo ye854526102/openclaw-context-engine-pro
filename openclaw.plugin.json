@@ -1,0 +1,74 @@
+{
+  "id": "context-engine-pro",
+  "name": "Context Engine Pro",
+  "version": "1.0.0",
+  "kind": "context-engine",
+  "description": "Advanced context management with intelligent compaction, message prioritization, and token optimization",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "maxContextTokens": {
+        "type": "number",
+        "description": "Maximum context window size in tokens (default: uses model's context window)"
+      },
+      "compactionThreshold": {
+        "type": "number",
+        "description": "Percentage of context window at which compaction triggers (default: 0.8 = 80%)"
+      },
+      "preserveRecentTurns": {
+        "type": "number",
+        "description": "Minimum recent turns to always preserve during compaction (default: 5)"
+      },
+      "enableSmartSummarization": {
+        "type": "boolean",
+        "description": "Use intelligent summarization that preserves key information (default: true)"
+      },
+      "priorityKeywords": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Keywords that indicate high-priority messages to preserve during compaction"
+      },
+      "enableSubagentContext": {
+        "type": "boolean",
+        "description": "Enable specialized context handling for subagent spawns (default: true)"
+      },
+      "maxSubagentContextTokens": {
+        "type": "number",
+        "description": "Maximum tokens to pass to subagents (default: half of parent context)"
+      }
+    }
+  },
+  "uiHints": {
+    "maxContextTokens": {
+      "label": "Max Context Tokens",
+      "help": "Override model's context window size (0 to use model default)"
+    },
+    "compactionThreshold": {
+      "label": "Compaction Threshold",
+      "placeholder": "0.8",
+      "help": "Trigger compaction when context reaches this percentage"
+    },
+    "preserveRecentTurns": {
+      "label": "Preserve Recent Turns",
+      "placeholder": "5",
+      "help": "Minimum conversation turns to keep during compaction"
+    },
+    "enableSmartSummarization": {
+      "label": "Smart Summarization",
+      "help": "Use AI-aware summarization that preserves critical context"
+    },
+    "priorityKeywords": {
+      "label": "Priority Keywords",
+      "help": "Messages containing these keywords are preserved during compaction"
+    },
+    "enableSubagentContext": {
+      "label": "Subagent Context",
+      "help": "Optimize context passed to spawned subagents"
+    },
+    "maxSubagentContextTokens": {
+      "label": "Max Subagent Tokens",
+      "help": "Token budget for subagent context (0 = auto)"
+    }
+  }
+}

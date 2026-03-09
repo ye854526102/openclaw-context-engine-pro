@@ -1,0 +1,68 @@
+{
+  "name": "@ye854526102/openclaw-context-engine-pro",
+  "version": "1.0.0",
+  "description": "Advanced context management engine for OpenClaw with intelligent compaction, message prioritization, and token optimization",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "openclaw.plugin.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "build:watch": "tsc --watch",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run clean && npm run build",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "keywords": [
+    "openclaw",
+    "context-engine",
+    "compaction",
+    "ai",
+    "llm",
+    "context-management",
+    "token-optimization",
+    "plugin"
+  ],
+  "author": "ye854526102",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ye854526102/openclaw-context-engine-pro.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ye854526102/openclaw-context-engine-pro/issues"
+  },
+  "homepage": "https://github.com/ye854526102/openclaw-context-engine-pro#readme",
+  "peerDependencies": {
+    "openclaw": ">=2026.3.7"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "typescript": "^5.3.0",
+    "vitest": "^1.2.0"
+  },
+  "openclaw": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
