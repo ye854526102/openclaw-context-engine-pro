@@ -15,6 +15,7 @@
     "dist",
     "openclaw.plugin.json",
     "README.md",
+    "README_CN.md",
     "LICENSE"
   ],
   "scripts": {
