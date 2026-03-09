@@ -21,7 +21,7 @@ describe("ContextEnginePro", () => {
     it("should return correct engine info", () => {
       expect(engine.info.id).toBe("context-engine-pro");
       expect(engine.info.name).toBe("Context Engine Pro");
-      expect(engine.info.version).toBe("1.0.0");
+      expect(engine.info.version).toBe("1.0.1");
       expect(engine.info.ownsCompaction).toBe(true);
     });
   });

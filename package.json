@@ -1,6 +1,6 @@
 {
   "name": "@ye854526102/openclaw-context-engine-pro",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Advanced context management engine for OpenClaw with intelligent compaction, message prioritization, and token optimization",
   "type": "module",
   "main": "./dist/index.js",
