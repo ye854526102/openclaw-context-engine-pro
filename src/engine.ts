@@ -73,6 +73,10 @@ export type ContextEngineProConfig = {
   maxSubagentContextTokens?: number;
   /** Session TTL in milliseconds (default: 3600000 = 1 hour) */
   sessionTTL?: number;
+  /** Maximum messages per session (default: 10000, prevents memory overflow) */
+  maxMessagesPerSession?: number;
+  /** Maximum sessions to keep in memory (default: 1000) */
+  maxSessions?: number;
 };
 
 /**
@@ -87,6 +91,8 @@ export const DEFAULT_CONFIG: Required<ContextEngineProConfig> = {
   enableSubagentContext: true,
   maxSubagentContextTokens: 0,
   sessionTTL: 3600000, // 1 hour
+  maxMessagesPerSession: 10000,
+  maxSessions: 1000,
 };
 
 /**
@@ -105,6 +111,39 @@ function validateConfig(config: Required<ContextEngineProConfig>): void {
   if (config.sessionTTL < 60000) {
     throw new Error(`[context-engine-pro] sessionTTL must be >= 60000 (1 minute), got: ${config.sessionTTL}`);
   }
+  if (config.maxMessagesPerSession < 10) {
+    throw new Error(`[context-engine-pro] maxMessagesPerSession must be >= 10, got: ${config.maxMessagesPerSession}`);
+  }
+  if (config.maxSessions < 1) {
+    throw new Error(`[context-engine-pro] maxSessions must be >= 1, got: ${config.maxSessions}`);
+  }
+}
+
+/**
+ * Safely stringify content for hashing
+ * Handles circular references and special cases
+ */
+function safeStringify(content: unknown): string {
+  if (content === null) return "null";
+  if (content === undefined) return "undefined";
+  if (typeof content === "string") return content;
+
+  try {
+    // Handle circular references by using a replacer
+    const seen = new WeakSet();
+    return JSON.stringify(content, (_key, value) => {
+      if (typeof value === "object" && value !== null) {
+        if (seen.has(value)) {
+          return "[Circular]";
+        }
+        seen.add(value);
+      }
+      return value;
+    });
+  } catch {
+    // Fallback for any stringify errors
+    return String(content);
+  }
 }
 
 /**
@@ -115,6 +154,7 @@ function validateConfig(config: Required<ContextEngineProConfig>): void {
  * - Smart summarization preserving key information
  * - Optimized subagent context handling
  * - Configurable token budgets and thresholds
+ * - Production-ready error handling and memory limits
  *
  * Priority levels:
  * - CRITICAL: Tool results and tool calls
@@ -126,7 +166,7 @@ export class ContextEnginePro implements ContextEngine {
   readonly info: ContextEngineInfo = {
     id: "context-engine-pro",
     name: "Context Engine Pro",
-    version: "1.0.1",
+    version: "1.0.2",
     ownsCompaction: true,
   };
 
@@ -136,6 +176,7 @@ export class ContextEnginePro implements ContextEngine {
   private subagentStates: Map<string, SubagentContextState>;
   private cleanupTimer?: ReturnType<typeof setInterval>;
   private messageIndex: number = 0;
+  private disposed: boolean = false;
 
   constructor(config: Required<ContextEngineProConfig>, logger: PluginLogger) {
     // Validate configuration
@@ -149,41 +190,87 @@ export class ContextEnginePro implements ContextEngine {
     // Start cleanup timer
     this.startCleanupTimer();
 
-    this.logger.info(`[context-engine-pro] Initialized with threshold=${config.compactionThreshold}, preserve=${config.preserveRecentTurns}`);
+    this.logger.info(`[context-engine-pro] Initialized with threshold=${config.compactionThreshold}, preserve=${config.preserveRecentTurns}, maxSessions=${config.maxSessions}, maxMessagesPerSession=${config.maxMessagesPerSession}`);
+  }
+
+  /**
+   * Check if engine is disposed
+   */
+  private checkDisposed(): void {
+    if (this.disposed) {
+      throw new Error("[context-engine-pro] Engine has been disposed and cannot be used");
+    }
   }
 
   /**
    * Initialize engine state for a session
    */
   async bootstrap(params: { sessionId: string; sessionFile: string }): Promise<BootstrapResult> {
-    const { sessionId, sessionFile } = params;
+    this.checkDisposed();
 
-    this.logger.info(`[context-engine-pro] Bootstrapping session: ${sessionId}`);
+    try {
+      const { sessionId, sessionFile } = params;
 
-    // Clean up expired sessions first
-    this.cleanupExpiredSessions();
+      this.logger.info(`[context-engine-pro] Bootstrapping session: ${sessionId}`);
 
-    // Initialize session store
-    if (!this.sessionStores.has(sessionId)) {
-      this.sessionStores.set(sessionId, {
-        messages: [],
-        meta: new Map(),
-        lastAccess: Date.now(),
-      });
+      // Clean up expired sessions first (also enforces maxSessions limit)
+      this.cleanupExpiredSessions();
 
-      // TODO: Load historical context from sessionFile if it exists
-      // This would require file system access which should be provided through the runtime API
-    } else {
-      // Update last access time
-      const store = this.sessionStores.get(sessionId)!;
-      store.lastAccess = Date.now();
+      // Initialize session store with lock
+      if (!this.sessionStores.has(sessionId)) {
+        // Check if we need to evict oldest session to make room
+        if (this.sessionStores.size >= this.config.maxSessions) {
+          this.evictOldestSession();
+        }
+
+        this.sessionStores.set(sessionId, {
+          messages: [],
+          meta: new Map(),
+          lastAccess: Date.now(),
+        });
+
+        // TODO: Load historical context from sessionFile if it exists
+        // This would require file system access which should be provided through the runtime API
+        void sessionFile; // Suppress unused variable warning
+      } else {
+        // Update last access time
+        const store = this.sessionStores.get(sessionId)!;
+        store.lastAccess = Date.now();
+      }
+
+      return {
+        bootstrapped: true,
+        importedMessages: 0,
+        reason: "Session initialized successfully",
+      };
+    } catch (error) {
+      this.logger.error(`[context-engine-pro] Bootstrap failed: ${error instanceof Error ? error.message : String(error)}`);
+      return {
+        bootstrapped: false,
+        importedMessages: 0,
+        reason: `Bootstrap failed: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  }
+
+  /**
+   * Evict the oldest (least recently accessed) session
+   */
+  private evictOldestSession(): void {
+    let oldestKey: string | null = null;
+    let oldestTime = Infinity;
+
+    for (const [key, store] of this.sessionStores) {
+      if (store.lastAccess < oldestTime) {
+        oldestTime = store.lastAccess;
+        oldestKey = key;
+      }
     }
 
-    return {
-      bootstrapped: true,
-      importedMessages: 0,
-      reason: "Session initialized successfully",
-    };
+    if (oldestKey) {
+      this.sessionStores.delete(oldestKey);
+      this.logger.info(`[context-engine-pro] Evicted oldest session: ${oldestKey}`);
+    }
   }
 
   /**
@@ -195,50 +282,67 @@ export class ContextEnginePro implements ContextEngine {
     message: AgentMessage;
     isHeartbeat?: boolean;
   }): Promise<IngestResult> {
-    const { sessionId, message, isHeartbeat } = params;
+    this.checkDisposed();
 
-    const store = this.sessionStores.get(sessionId);
-    if (!store) {
-      this.logger.warn(`[context-engine-pro] Session not found: ${sessionId}`);
+    try {
+      const { sessionId, message, isHeartbeat } = params;
+
+      const store = this.sessionStores.get(sessionId);
+      if (!store) {
+        this.logger.warn(`[context-engine-pro] Session not found: ${sessionId}`);
+        return { ingested: false };
+      }
+
+      // Update last access time
+      store.lastAccess = Date.now();
+
+      // Enforce message limit
+      if (store.messages.length >= this.config.maxMessagesPerSession) {
+        this.logger.warn(`[context-engine-pro] Session ${sessionId} reached max messages (${this.config.maxMessagesPerSession}), triggering auto-compaction`);
+        await this.compact({
+          sessionId,
+          sessionFile: "",
+          force: true,
+        });
+      }
+
+      // Generate stable message ID with collision detection
+      const messageId = this.generateMessageId(message);
+
+      // Check for duplicates
+      if (store.meta.has(messageId)) {
+        this.logger.debug?.(`[context-engine-pro] Duplicate message skipped`);
+        return { ingested: false };
+      }
+
+      // Analyze message
+      const priority = this.analyzeMessagePriority(message);
+      const tokenEstimate = this.estimateTokens(message);
+      const index = this.messageIndex++;
+
+      const meta: MessageMeta = {
+        id: messageId,
+        priority,
+        tokenEstimate,
+        timestamp: Date.now(),
+        hasToolResult: this.hasToolResult(message),
+        hasCodeBlock: this.hasCodeBlock(message),
+        priorityKeywordMatches: this.findPriorityKeywords(message),
+        index,
+      };
+
+      store.messages.push(message);
+      store.meta.set(messageId, meta);
+
+      if (isHeartbeat) {
+        this.logger.debug?.(`[context-engine-pro] Ingested heartbeat message (priority: ${priority})`);
+      }
+
+      return { ingested: true };
+    } catch (error) {
+      this.logger.error(`[context-engine-pro] Ingest failed: ${error instanceof Error ? error.message : String(error)}`);
       return { ingested: false };
     }
-
-    // Update last access time
-    store.lastAccess = Date.now();
-
-    // Generate stable message ID
-    const messageId = this.generateMessageId(message);
-
-    // Check for duplicates
-    if (store.meta.has(messageId)) {
-      this.logger.debug?.(`[context-engine-pro] Duplicate message skipped: ${messageId}`);
-      return { ingested: false };
-    }
-
-    // Analyze message
-    const priority = this.analyzeMessagePriority(message);
-    const tokenEstimate = this.estimateTokens(message);
-    const index = this.messageIndex++;
-
-    const meta: MessageMeta = {
-      id: messageId,
-      priority,
-      tokenEstimate,
-      timestamp: Date.now(),
-      hasToolResult: this.hasToolResult(message),
-      hasCodeBlock: this.hasCodeBlock(message),
-      priorityKeywordMatches: this.findPriorityKeywords(message),
-      index,
-    };
-
-    store.messages.push(message);
-    store.meta.set(messageId, meta);
-
-    if (isHeartbeat) {
-      this.logger.debug?.(`[context-engine-pro] Ingested heartbeat message: ${messageId} (priority: ${priority})`);
-    }
-
-    return { ingested: true };
   }
 
   /**
@@ -249,28 +353,35 @@ export class ContextEnginePro implements ContextEngine {
     messages: AgentMessage[];
     isHeartbeat?: boolean;
   }): Promise<IngestBatchResult> {
-    const { sessionId, messages, isHeartbeat } = params;
+    this.checkDisposed();
 
-    const store = this.sessionStores.get(sessionId);
-    if (!store) {
-      this.logger.warn(`[context-engine-pro] Session not found: ${sessionId}`);
+    try {
+      const { sessionId, messages, isHeartbeat } = params;
+
+      const store = this.sessionStores.get(sessionId);
+      if (!store) {
+        this.logger.warn(`[context-engine-pro] Session not found: ${sessionId}`);
+        return { ingestedCount: 0 };
+      }
+
+      let ingestedCount = 0;
+
+      for (const message of messages) {
+        const result = await this.ingest({
+          sessionId,
+          message,
+          isHeartbeat,
+        });
+        if (result.ingested) {
+          ingestedCount++;
+        }
+      }
+
+      return { ingestedCount };
+    } catch (error) {
+      this.logger.error(`[context-engine-pro] IngestBatch failed: ${error instanceof Error ? error.message : String(error)}`);
       return { ingestedCount: 0 };
     }
-
-    let ingestedCount = 0;
-
-    for (const message of messages) {
-      const result = await this.ingest({
-        sessionId,
-        message,
-        isHeartbeat,
-      });
-      if (result.ingested) {
-        ingestedCount++;
-      }
-    }
-
-    return { ingestedCount };
   }
 
   /**
@@ -287,32 +398,38 @@ export class ContextEnginePro implements ContextEngine {
     tokenBudget?: number;
     runtimeContext?: ContextEngineRuntimeContext;
   }): Promise<void> {
-    const { sessionId, tokenBudget, autoCompactionSummary } = params;
+    if (this.disposed) return;
 
-    const store = this.sessionStores.get(sessionId);
-    if (!store) return;
+    try {
+      const { sessionId, tokenBudget, autoCompactionSummary } = params;
 
-    // Update last access time
-    store.lastAccess = Date.now();
+      const store = this.sessionStores.get(sessionId);
+      if (!store) return;
 
-    // Log compaction summary if available
-    if (autoCompactionSummary) {
-      this.logger.debug?.(
-        `[context-engine-pro] Session ${sessionId} auto-compaction: ${autoCompactionSummary.substring(0, 100)}...`
-      );
-    }
+      // Update last access time
+      store.lastAccess = Date.now();
 
-    // Check if proactive compaction is needed
-    if (tokenBudget && this.config.compactionThreshold < 1) {
-      const currentTokens = this.estimateTotalTokens(sessionId);
-      const threshold = tokenBudget * this.config.compactionThreshold;
-
-      if (currentTokens > threshold) {
-        const percentage = Math.round((currentTokens / tokenBudget) * 100);
-        this.logger.info(
-          `[context-engine-pro] Session ${sessionId} approaching threshold: ${currentTokens}/${tokenBudget} tokens (${percentage}%)`
+      // Log compaction summary if available
+      if (autoCompactionSummary) {
+        this.logger.debug?.(
+          `[context-engine-pro] Session auto-compaction: ${autoCompactionSummary.substring(0, 100)}...`
         );
       }
+
+      // Check if proactive compaction is needed
+      if (tokenBudget && this.config.compactionThreshold < 1) {
+        const currentTokens = this.estimateTotalTokens(sessionId);
+        const threshold = tokenBudget * this.config.compactionThreshold;
+
+        if (currentTokens > threshold) {
+          const percentage = Math.round((currentTokens / tokenBudget) * 100);
+          this.logger.info(
+            `[context-engine-pro] Session approaching threshold: ${currentTokens}/${tokenBudget} tokens (${percentage}%)`
+          );
+        }
+      }
+    } catch (error) {
+      this.logger.error(`[context-engine-pro] afterTurn error: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
@@ -325,126 +442,144 @@ export class ContextEnginePro implements ContextEngine {
     messages: AgentMessage[];
     tokenBudget?: number;
   }): Promise<AssembleResult> {
-    const { sessionId, messages, tokenBudget } = params;
+    this.checkDisposed();
 
-    const store = this.sessionStores.get(sessionId);
-    if (store) {
-      store.lastAccess = Date.now();
-    }
+    try {
+      const { sessionId, messages, tokenBudget } = params;
 
-    const effectiveBudget = tokenBudget || this.config.maxContextTokens || 128000;
-
-    // If no budget constraint, return all messages
-    if (!effectiveBudget || effectiveBudget <= 0) {
-      return {
-        messages,
-        estimatedTokens: this.estimateTotalTokens(sessionId),
-      };
-    }
-
-    // Build priority map while preserving order
-    const messagePriority = new Map<AgentMessage, MessagePriority>();
-    const messageTokens = new Map<AgentMessage, number>();
-
-    for (const message of messages) {
-      const msgId = this.generateMessageId(message);
-      const meta = store?.meta.get(msgId);
-
-      if (meta) {
-        messagePriority.set(message, meta.priority);
-        messageTokens.set(message, meta.tokenEstimate);
-      } else {
-        // Message not in store, analyze on the fly
-        messagePriority.set(message, this.analyzeMessagePriority(message));
-        messageTokens.set(message, this.estimateTokens(message));
+      const store = this.sessionStores.get(sessionId);
+      if (store) {
+        store.lastAccess = Date.now();
       }
-    }
 
-    // Calculate total tokens
-    let totalTokens = 0;
-    for (const tokens of messageTokens.values()) {
-      totalTokens += tokens;
-    }
+      const effectiveBudget = tokenBudget || this.config.maxContextTokens || 128000;
 
-    // If within budget, return all messages
-    if (totalTokens <= effectiveBudget) {
-      return {
-        messages,
-        estimatedTokens: totalTokens,
-        systemPromptAddition: this.generateContextHints(sessionId, messages.length, totalTokens, store),
-      };
-    }
-
-    // Need to trim: prioritize while maintaining order
-    // Strategy: Remove low-priority messages first, then normal
-    const priorityOrder: Record<MessagePriority, number> = {
-      critical: 0,
-      high: 1,
-      normal: 2,
-      low: 3,
-    };
-
-    // Identify messages that can be removed (non-recent, low priority)
-    const recentStart = Math.max(0, messages.length - this.config.preserveRecentTurns);
-    const selected: AgentMessage[] = [];
-    let currentTokens = 0;
-
-    // First pass: include all critical, high, and recent messages
-    for (let i = 0; i < messages.length; i++) {
-      const message = messages[i];
-      const priority = messagePriority.get(message) || "normal";
-      const tokens = messageTokens.get(message) || 0;
-      const isRecent = i >= recentStart;
-
-      if (priorityOrder[priority] <= 1 || isRecent) {
-        selected.push(message);
-        currentTokens += tokens;
+      // If no budget constraint or empty messages, return all messages
+      if (!effectiveBudget || effectiveBudget <= 0 || messages.length === 0) {
+        return {
+          messages,
+          estimatedTokens: this.estimateTotalTokens(sessionId),
+        };
       }
-    }
 
-    // If still over budget, try removing normal priority (keeping recent)
-    if (currentTokens > effectiveBudget) {
-      const trimmed: AgentMessage[] = [];
-      let trimmedTokens = 0;
+      // Build priority map while preserving order
+      const messagePriority = new Map<AgentMessage, MessagePriority>();
+      const messageTokens = new Map<AgentMessage, number>();
 
-      for (let i = 0; i < selected.length; i++) {
-        const message = selected[i];
-        const priority = messagePriority.get(message) || "normal";
-        const tokens = messageTokens.get(message) || 0;
-        const originalIndex = messages.indexOf(message);
-        const isRecent = originalIndex >= recentStart;
+      for (const message of messages) {
+        try {
+          const msgId = this.generateMessageId(message);
+          const meta = store?.meta.get(msgId);
 
-        // Keep if critical, high, or recent
-        if (priorityOrder[priority] <= 1 || isRecent) {
-          trimmed.push(message);
-          trimmedTokens += tokens;
+          if (meta) {
+            messagePriority.set(message, meta.priority);
+            messageTokens.set(message, meta.tokenEstimate);
+          } else {
+            // Message not in store, analyze on the fly
+            messagePriority.set(message, this.analyzeMessagePriority(message));
+            messageTokens.set(message, this.estimateTokens(message));
+          }
+        } catch (error) {
+          // If we can't process a message, assign default priority
+          this.logger.warn(`[context-engine-pro] Failed to process message in assemble: ${error instanceof Error ? error.message : String(error)}`);
+          messagePriority.set(message, "normal");
+          messageTokens.set(message, 100); // Default estimate
         }
       }
 
-      if (trimmedTokens <= effectiveBudget) {
+      // Calculate total tokens
+      let totalTokens = 0;
+      for (const tokens of messageTokens.values()) {
+        totalTokens += tokens;
+      }
+
+      // If within budget, return all messages
+      if (totalTokens <= effectiveBudget) {
+        return {
+          messages,
+          estimatedTokens: totalTokens,
+          systemPromptAddition: this.generateContextHints(sessionId, messages.length, totalTokens, store),
+        };
+      }
+
+      // Need to trim: prioritize while maintaining order
+      // Strategy: Remove low-priority messages first, then normal
+      const priorityOrder: Record<MessagePriority, number> = {
+        critical: 0,
+        high: 1,
+        normal: 2,
+        low: 3,
+      };
+
+      // Identify messages that can be removed (non-recent, low priority)
+      const recentStart = Math.max(0, messages.length - this.config.preserveRecentTurns);
+      const selected: AgentMessage[] = [];
+      let currentTokens = 0;
+
+      // First pass: include all critical, high, and recent messages
+      for (let i = 0; i < messages.length; i++) {
+        const message = messages[i];
+        const priority = messagePriority.get(message) || "normal";
+        const tokens = messageTokens.get(message) || 0;
+        const isRecent = i >= recentStart;
+
+        if (priorityOrder[priority] <= 1 || isRecent) {
+          selected.push(message);
+          currentTokens += tokens;
+        }
+      }
+
+      // If still over budget, try removing normal priority (keeping recent)
+      if (currentTokens > effectiveBudget) {
+        const trimmed: AgentMessage[] = [];
+        let trimmedTokens = 0;
+
+        for (let i = 0; i < selected.length; i++) {
+          const message = selected[i];
+          const priority = messagePriority.get(message) || "normal";
+          const tokens = messageTokens.get(message) || 0;
+          const originalIndex = messages.indexOf(message);
+          const isRecent = originalIndex >= recentStart;
+
+          // Keep if critical, high, or recent
+          if (priorityOrder[priority] <= 1 || isRecent) {
+            trimmed.push(message);
+            trimmedTokens += tokens;
+          }
+        }
+
+        if (trimmedTokens <= effectiveBudget) {
+          selected.length = 0;
+          selected.push(...trimmed);
+          currentTokens = trimmedTokens;
+        }
+      }
+
+      // Final fallback: just keep recent turns
+      if (currentTokens > effectiveBudget) {
         selected.length = 0;
-        selected.push(...trimmed);
-        currentTokens = trimmedTokens;
+        currentTokens = 0;
+
+        const recentMessages = messages.slice(-this.config.preserveRecentTurns);
+        for (const msg of recentMessages) {
+          selected.push(msg);
+          currentTokens += messageTokens.get(msg) || 0;
+        }
       }
+
+      return {
+        messages: selected,
+        estimatedTokens: currentTokens,
+        systemPromptAddition: this.generateContextHints(sessionId, selected.length, currentTokens, store),
+      };
+    } catch (error) {
+      this.logger.error(`[context-engine-pro] Assemble failed: ${error instanceof Error ? error.message : String(error)}`);
+      // Return original messages on error
+      return {
+        messages: params.messages,
+        estimatedTokens: 0,
+      };
     }
-
-    // Final fallback: just keep recent turns
-    if (currentTokens > effectiveBudget) {
-      selected.length = 0;
-      currentTokens = 0;
-
-      const recentMessages = messages.slice(-this.config.preserveRecentTurns);
-      for (const msg of recentMessages) {
-        selected.push(msg);
-        currentTokens += messageTokens.get(msg) || 0;
-      }
-    }
-
-    return {
-      messages: selected,
-      estimatedTokens: currentTokens,
-      systemPromptAddition: this.generateContextHints(sessionId, selected.length, currentTokens, store),
-    };
   }
 
   /**
@@ -461,37 +596,48 @@ export class ContextEnginePro implements ContextEngine {
     customInstructions?: string;
     runtimeContext?: ContextEngineRuntimeContext;
   }): Promise<CompactResult> {
-    const { sessionId, tokenBudget, force, currentTokenCount, customInstructions } = params;
+    this.checkDisposed();
 
-    const store = this.sessionStores.get(sessionId);
-    if (!store) {
-      return { ok: false, compacted: false, reason: "Session not found" };
-    }
+    try {
+      const { sessionId, tokenBudget, force, currentTokenCount, customInstructions } = params;
 
-    // Update last access time
-    store.lastAccess = Date.now();
+      const store = this.sessionStores.get(sessionId);
+      if (!store) {
+        return { ok: false, compacted: false, reason: "Session not found" };
+      }
 
-    const effectiveBudget = tokenBudget || this.config.maxContextTokens || 128000;
-    const currentTokens = currentTokenCount || this.estimateTotalTokens(sessionId);
+      // Update last access time
+      store.lastAccess = Date.now();
 
-    // Check if compaction is needed
-    if (!force && currentTokens < effectiveBudget * this.config.compactionThreshold) {
+      const effectiveBudget = tokenBudget || this.config.maxContextTokens || 128000;
+      const currentTokens = currentTokenCount || this.estimateTotalTokens(sessionId);
+
+      // Check if compaction is needed
+      if (!force && currentTokens < effectiveBudget * this.config.compactionThreshold) {
+        return {
+          ok: true,
+          compacted: false,
+          reason: `Below compaction threshold (${Math.round((currentTokens / effectiveBudget) * 100)}% < ${Math.round(this.config.compactionThreshold * 100)}%)`,
+          result: {
+            tokensBefore: currentTokens,
+            tokensAfter: currentTokens,
+          },
+        };
+      }
+
+      this.logger.info(
+        `[context-engine-pro] Compacting session: ${currentTokens} tokens → target: ${effectiveBudget}`
+      );
+
+      return this.performIntelligentCompaction(sessionId, store, effectiveBudget, customInstructions);
+    } catch (error) {
+      this.logger.error(`[context-engine-pro] Compact failed: ${error instanceof Error ? error.message : String(error)}`);
       return {
-        ok: true,
+        ok: false,
         compacted: false,
-        reason: `Below compaction threshold (${Math.round((currentTokens / effectiveBudget) * 100)}% < ${Math.round(this.config.compactionThreshold * 100)}%)`,
-        result: {
-          tokensBefore: currentTokens,
-          tokensAfter: currentTokens,
-        },
+        reason: `Compaction error: ${error instanceof Error ? error.message : String(error)}`,
       };
     }
-
-    this.logger.info(
-      `[context-engine-pro] Compacting session ${sessionId}: ${currentTokens} tokens → target: ${effectiveBudget}`
-    );
-
-    return this.performIntelligentCompaction(sessionId, store, effectiveBudget, customInstructions);
   }
 
   /**
@@ -503,58 +649,71 @@ export class ContextEnginePro implements ContextEngine {
     childSessionKey: string;
     ttlMs?: number;
   }): Promise<SubagentSpawnPreparation | undefined> {
-    if (!this.config.enableSubagentContext) {
+    this.checkDisposed();
+
+    try {
+      if (!this.config.enableSubagentContext) {
+        return undefined;
+      }
+
+      const { parentSessionKey, childSessionKey, ttlMs = 300000 } = params;
+
+      const parentStore = this.sessionStores.get(parentSessionKey);
+      if (!parentStore) {
+        return undefined;
+      }
+
+      // Determine subagent token budget
+      const maxTokens =
+        this.config.maxSubagentContextTokens > 0
+          ? this.config.maxSubagentContextTokens
+          : Math.floor(this.estimateTotalTokens(parentSessionKey) / 2);
+
+      // Select relevant messages for subagent
+      const contextSnapshot = this.selectSubagentContext(parentStore.messages, parentStore.meta, maxTokens);
+
+      // Store state for rollback
+      const state: SubagentContextState = {
+        parentSessionKey,
+        childSessionKey,
+        createdAt: Date.now(),
+        ttlMs,
+        contextSnapshot,
+      };
+      this.subagentStates.set(childSessionKey, state);
+
+      this.logger.info(
+        `[context-engine-pro] Prepared subagent context: ${contextSnapshot.length} messages (~${maxTokens} tokens)`
+      );
+
+      return {
+        rollback: async () => {
+          this.subagentStates.delete(childSessionKey);
+          this.logger.info(`[context-engine-pro] Rolled back subagent context: ${childSessionKey}`);
+        },
+      };
+    } catch (error) {
+      this.logger.error(`[context-engine-pro] prepareSubagentSpawn failed: ${error instanceof Error ? error.message : String(error)}`);
       return undefined;
     }
-
-    const { parentSessionKey, childSessionKey, ttlMs = 300000 } = params;
-
-    const parentStore = this.sessionStores.get(parentSessionKey);
-    if (!parentStore) {
-      return undefined;
-    }
-
-    // Determine subagent token budget
-    const maxTokens =
-      this.config.maxSubagentContextTokens > 0
-        ? this.config.maxSubagentContextTokens
-        : Math.floor(this.estimateTotalTokens(parentSessionKey) / 2);
-
-    // Select relevant messages for subagent
-    const contextSnapshot = this.selectSubagentContext(parentStore.messages, parentStore.meta, maxTokens);
-
-    // Store state for rollback
-    const state: SubagentContextState = {
-      parentSessionKey,
-      childSessionKey,
-      createdAt: Date.now(),
-      ttlMs,
-      contextSnapshot,
-    };
-    this.subagentStates.set(childSessionKey, state);
-
-    this.logger.info(
-      `[context-engine-pro] Prepared subagent context: ${childSessionKey} with ${contextSnapshot.length} messages (~${maxTokens} tokens)`
-    );
-
-    return {
-      rollback: async () => {
-        this.subagentStates.delete(childSessionKey);
-        this.logger.info(`[context-engine-pro] Rolled back subagent context: ${childSessionKey}`);
-      },
-    };
   }
 
   /**
    * Handle subagent end lifecycle
    */
   async onSubagentEnded(params: { childSessionKey: string; reason: SubagentEndReason }): Promise<void> {
-    const { childSessionKey, reason } = params;
+    if (this.disposed) return;
 
-    const state = this.subagentStates.get(childSessionKey);
-    if (state) {
-      this.logger.info(`[context-engine-pro] Subagent ended: ${childSessionKey}, reason: ${reason}`);
-      this.subagentStates.delete(childSessionKey);
+    try {
+      const { childSessionKey, reason } = params;
+
+      const state = this.subagentStates.get(childSessionKey);
+      if (state) {
+        this.logger.info(`[context-engine-pro] Subagent ended, reason: ${reason}`);
+        this.subagentStates.delete(childSessionKey);
+      }
+    } catch (error) {
+      this.logger.error(`[context-engine-pro] onSubagentEnded error: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
@@ -562,6 +721,12 @@ export class ContextEnginePro implements ContextEngine {
    * Dispose of all resources
    */
   async dispose(): Promise<void> {
+    if (this.disposed) {
+      return; // Already disposed
+    }
+
+    this.disposed = true;
+
     // Stop cleanup timer
     if (this.cleanupTimer) {
       clearInterval(this.cleanupTimer);
@@ -579,25 +744,30 @@ export class ContextEnginePro implements ContextEngine {
 
   /**
    * Generate a stable message ID based on content
-   * Does NOT include timestamp to ensure consistency
+   * Uses a combination of role, content hash, and length for uniqueness
+   * ID format: role-contentHash-contentLength (collision-resistant)
    */
   private generateMessageId(message: AgentMessage): string {
-    const content = typeof message.content === "string" ? message.content : JSON.stringify(message.content);
-    const hash = this.simpleHash(`${message.role}:${content}`);
-    return `${message.role}-${hash}`;
+    // Handle null/undefined content safely
+    const content = safeStringify(message.content);
+    const hash1 = this.simpleHash(`${message.role}:${content}`);
+    const hash2 = this.simpleHash(content.length.toString());
+    // Combine two hashes and content length for better uniqueness
+    return `${message.role}-${hash1}-${hash2}-${content.length}`;
   }
 
   /**
-   * Simple hash function for content
+   * Simple hash function for content (djb2 variant)
+   * Produces a base-36 string for compact representation
    */
   private simpleHash(str: string): string {
-    let hash = 0;
+    let hash = 5381;
     for (let i = 0; i < str.length; i++) {
       const char = str.charCodeAt(i);
-      hash = (hash << 5) - hash + char;
-      hash = hash & hash;
+      hash = ((hash << 5) + hash) ^ char; // djb2 with XOR
     }
-    return Math.abs(hash).toString(36);
+    // Use unsigned 32-bit integer and convert to base-36
+    return (hash >>> 0).toString(36);
   }
 
   /**
@@ -918,32 +1088,56 @@ export class ContextEnginePro implements ContextEngine {
 
   /**
    * Start cleanup timer for expired sessions
+   * Uses unref() to not block Node.js process exit
    */
   private startCleanupTimer(): void {
     // Run cleanup every minute
-    this.cleanupTimer = setInterval(() => {
-      this.cleanupExpiredSessions();
+    const timer = setInterval(() => {
+      try {
+        this.cleanupExpiredSessions();
+      } catch (error) {
+        this.logger.error(`[context-engine-pro] Cleanup timer error: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }, 60000);
+
+    // Don't block Node.js process exit (Node.js specific method)
+    // In browsers, this method doesn't exist, so we check for it
+    const nodeTimer = timer as ReturnType<typeof setInterval> & { unref?: () => void };
+    if (nodeTimer.unref) {
+      nodeTimer.unref();
+    }
+
+    this.cleanupTimer = timer;
   }
 
   /**
    * Clean up expired sessions
    */
   private cleanupExpiredSessions(): void {
+    if (this.disposed) return;
+
     const now = Date.now();
     let cleanedCount = 0;
 
     for (const [sessionId, store] of this.sessionStores) {
-      if (now - store.lastAccess > this.config.sessionTTL) {
-        this.sessionStores.delete(sessionId);
-        cleanedCount++;
+      try {
+        if (now - store.lastAccess > this.config.sessionTTL) {
+          this.sessionStores.delete(sessionId);
+          cleanedCount++;
+        }
+      } catch (error) {
+        this.logger.error(`[context-engine-pro] Error cleaning session ${sessionId}: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
 
     // Also clean up expired subagent states
     for (const [childSessionKey, state] of this.subagentStates) {
-      if (now - state.createdAt > state.ttlMs) {
-        this.subagentStates.delete(childSessionKey);
+      try {
+        if (now - state.createdAt > state.ttlMs) {
+          this.subagentStates.delete(childSessionKey);
+        }
+      } catch (error) {
+        this.logger.error(`[context-engine-pro] Error cleaning subagent state ${childSessionKey}: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
 

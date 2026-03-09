@@ -21,7 +21,7 @@ describe("ContextEnginePro", () => {
     it("should return correct engine info", () => {
       expect(engine.info.id).toBe("context-engine-pro");
       expect(engine.info.name).toBe("Context Engine Pro");
-      expect(engine.info.version).toBe("1.0.1");
+      expect(engine.info.version).toBe("1.0.2");
       expect(engine.info.ownsCompaction).toBe(true);
     });
   });
@@ -356,9 +356,17 @@ describe("ContextEnginePro", () => {
 
       await engine.dispose();
 
-      // After dispose, bootstrap should still work (new state)
-      const result = await engine.bootstrap({ sessionId: "test", sessionFile: "/path" });
-      expect(result.bootstrapped).toBe(true);
+      // After dispose, the engine should be marked as disposed
+      expect(engine.info.id).toBe("context-engine-pro");
+    });
+
+    it("should throw error after dispose", async () => {
+      await engine.bootstrap({ sessionId: "test", sessionFile: "/path" });
+      await engine.dispose();
+
+      // After dispose, bootstrap should throw error
+      await expect(engine.bootstrap({ sessionId: "test", sessionFile: "/path" }))
+        .rejects.toThrow("Engine has been disposed");
     });
   });
 
